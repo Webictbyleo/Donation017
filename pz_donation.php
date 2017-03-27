@@ -8,6 +8,9 @@ require_once(SITE.DELIMITER_DIR.'plugins/plug_ponziguard/libs/notification.php')
 			private $hubid;
 			private $hasQue;
 			private $updated = array();
+			private $isSplit;
+			private $sharers;
+			private $temp_donation;
 			function confirm(PZ_donor &$getter){
 				if(!$this->isloaded())return false;
 				if($getter->get('id') == $this->uid){
@@ -17,9 +20,18 @@ require_once(SITE.DELIMITER_DIR.'plugins/plug_ponziguard/libs/notification.php')
 				if($getter->get('id') != $this->paid AND $getter->user->ingroups(array(400,500))){
 					throw new Exception('Operation access denied. Only the receiving party can confirm');
 				}
+				$db = mspdo::getInstance();
+				if($this->isSplit AND count($this->sharers) > 0){
+					array_pop($this->sharers);
+					//Next getter
+					$db->rawquery('UPDATE `'.config::get()->Dbprefix.'donation_archive` SET data="'.implode('|',$this->sharers).'" WHERE type=222 AND ack='.$this->fid.' ');
+					$this->paid = current($this->sharers);
+					$this->save();
+					return;
+				}
 				$hq = $this->hasReturnQue();
 				$isadmin = $getter->user->ingroups(array(400,500));
-				$db = mspdo::getInstance();
+				
 				$w = $db->rawquery('SELECT SUM(uid) AS amount,ack FROM `'.config::get()->Dbprefix.'donation_archive` WHERE type=1000 AND ack="'.$this->paid.'" OR ack="'.$this->uid.'" GROUP BY ack LIMIT 2');
 				
 				$wallets = array();
@@ -94,6 +106,24 @@ require_once(SITE.DELIMITER_DIR.'plugins/plug_ponziguard/libs/notification.php')
 				$values = '('.$this->hubid.',"'.$m[$this->donation]['return'].'","'.$crtd.'",1000,"'.$this->uid.'")';
 				$db->rawquery('INSERT INTO `'.config::get()->Dbprefix.'donation_archive` (data,uid,created,type,ack) VALUES '.$values);
 					}
+					//If giver has referer
+					$giver = new pz_donor($this->uid);
+					
+					if($c->use_ref_bonus AND $giver->hasReferer()){
+						$ref_gain = $c->ref_gain;
+						$isperc = (($perc=trim($ref_gain,'%')) !==$ref_gain);
+						if($isperc){
+							$ref_gain = (($this->donation / 100)*$perc);
+						}
+							if(is_numeric($ref_gain)){
+						$db->rawquery('UPDATE `'.config::get()->Dbprefix.'donation_archive` SET data=data+'.$ref_gain.' WHERE type=300 AND uid='.$giver->referer.' ');
+							}
+						
+					}
+					//If donation is split and giver has paid all
+					if($this->isSplit){
+						$db->rawquery('DELETE FROM `'.config::get()->Dbprefix.'donation_archive` WHERE type=222 AND ack='.$this->fid.' ');
+					}
 				$db->getConnection()->commit();
 				
 			}
@@ -112,17 +142,26 @@ require_once(SITE.DELIMITER_DIR.'plugins/plug_ponziguard/libs/notification.php')
 				//Purge donation
 			}
 			
-			function mergeWith(PZ_donor &$getter){
+			function mergeWith(PZ_donor &$getter,array $multi_getters=array()){
 				if(!$getter->canReceive())return false;
 				if(!$this->isloaded())return false;
+				
 					if($getter->get('id') == $this->uid){
 						throw new Exception('Merging to self rejected!');
 					}
+					$db = mspdo::getInstance();
+					$crtd = date('Y-m-d H:i:s');
+					
 					$this->state = 1;
 					$this->paid = $getter->get('id');
 					$this->save();
-					$db = mspdo::getInstance();
-				$db->rawquery('UPDATE `'.config::get()->Dbprefix.'formbuilder_data` SET created="'.date('Y-m-d H:i:s').'" WHERE id='.$this->fid.' ');
+					
+					
+				$db->rawquery('UPDATE `'.config::get()->Dbprefix.'formbuilder_data` SET created="'.$crtd.'" WHERE id='.$this->fid.' ');
+				if(!empty($multi_getters)){
+						
+					$db->rawquery('INSERT INTO `'.config::get()->Dbprefix.'donation_archive` (data,uid,created,type,ack) VALUES ("'.implode('|',$multi_getters).'",'.$this->uid.',"'.$crtd.'","222","'.$this->id.'")');
+				}
 				$db->getConnection()->commit();
 					$link = 'https://'.SYS_DOMAIN_HOST.'/index.php?app=com_formbuilder&view=item&ack='.$this->id;
 				$msg = '<div style="text-align:center;color:black;font-size:24px"><p>Please follow the <a href="'.$link.'">link </a> to  proceed</p><p>Transaction AMOUNT: <strong>'.$this->donation.'</strong></p></div>';
@@ -195,12 +234,35 @@ require_once(SITE.DELIMITER_DIR.'plugins/plug_ponziguard/libs/notification.php')
 				$this->setProto('paid',NULL,$a['paid']);
 				$this->setProto('uid','int',$a['uid'],true);
 				$this->setProto('state','int',$a['state']);
-				$this->setProto('donation','int',$a['donation'],true);
+				$this->setProto('donation','int',$a['donation']);
 				$this->setProto('created','string',$a['created'],true);
 				$this->hubid = $a['hubID'];
 				$this->fid = $a['id'];
+					if($a['state'] > 0 AND $a['state'] !=4){
+				$db = mspdo::getInstance();
+				$get = $db->rawquery('SELECT data FROM `'.config::get()->Dbprefix.'donation_archive` WHERE type=222 AND ack='.$this->fid.'');
+					if(!empty($get)){
+						$this->isSplit = true;
+						$sh = array();
+						foreach($get as $k => $v){
+							$sh = array_merge($sh,explode('|',$v['data']));
+						}
+						
+						$this->sharers = array_unique($sh);
+							
+						
+						//Find temporary donation amount for a shared user
+						$get = $db->rawquery('SELECT cue.uid AS amount FROM `'.config::get()->Dbprefix.'donation_archive` AS cue WHERE cue.type=1000 AND cue.ack = '.$a['paid'].' LIMIT 1');
+						if(!empty($get)){
+							$this->temp_donation = $get[0]['amount'];
+						}
+						
+					}
+						}
+				
 				$this->setFromArray($a);
 				parent::setCallback('onBeforeSet','pz_donation::resolveUpdate');
+				parent::setCallback('onBeforeGet','pz_donation::refresh');
 				return $this;
 			}
 			
@@ -226,6 +288,12 @@ require_once(SITE.DELIMITER_DIR.'plugins/plug_ponziguard/libs/notification.php')
 					
 				$this->updated[$name] = $value;
 					
+			}
+			
+			public function refresh($name){
+				if($name =='donation' AND $this->isSplit){
+					$this->donation = $this->temp_donation;
+				}
 			}
 			function followRedirect(){
 				$link = director::protocolAndHost().'/index.php?app=com_formbuilder&view=item&ack='.$this->id;
